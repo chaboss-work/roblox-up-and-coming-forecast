@@ -61,6 +61,10 @@ DEFAULTS = {
     "pn_mult": 1.25,    # multiplier on the new-game rate
     "use_g72": True,    # include the 72-hour player growth feature
     "dens_h": 3.0,      # reads within this many hours share one read's weight in the drift fit
+    "top_sig": 0.3,     # extra noise for the top three places (1 at #1, fading to 0 at #4)
+    "gamma": 0.0,       # Box-Cox exponent of the latent rank scale (0: log rank)
+    "drift_pow": 1.0,   # drift grows as (h/24) ** drift_pow
+    "drop_p": 0.0,      # leave games below this probability unnamed (their mass joins the unnamed share)
     "temp": 1.0,        # power applied to each place's named probabilities (below 1 flattens)
     "jump_p": 0.0,      # chance of a heavy-tailed move
     "jump_sd": 3.0,     # its noise multiplier
@@ -349,8 +353,18 @@ def mc_probs(reads, hs, prm):
     F = features(reads, len(reads) - 1, first, prm["use_g72"])
     ids = reads[-1]["ids"][:prm["max_rank"]]
     kappa = prm["kappa"]
-    base = [-math.log(r) for r in range(1, len(ids) + 1)]
-    drift = [-kappa * sum(b * v for b, v in zip(beta, F[u])) for u in ids]  # per day, latent up = better
+    gam = prm["gamma"]
+    if gam == 0:
+        base = [-math.log(r) for r in range(1, len(ids) + 1)]
+        jac = [1.0] * len(ids)
+    else:
+        # Box-Cox rank scale: -(r^g - 1) / g; the drift is fitted in log-rank units, so it is
+        # carried over with the scale's slope d(latent)/d(log r) = r^g
+        base = [-(r ** gam - 1.0) / gam for r in range(1, len(ids) + 1)]
+        jac = [r ** gam for r in range(1, len(ids) + 1)]
+    drift = [-kappa * jac[q] * sum(b * v for b, v in zip(beta, F[u])) for q, u in enumerate(ids)]  # per day, latent up = better
+    tt = prm["top_sig"]
+    sm = [1.0 + tt * max(0.0, 1.0 - math.log(r) / math.log(4.0)) for r in range(1, len(ids) + 1)]
     rnd = __import__("random").Random(prm["seed"])
     S = prm["samples"]
     step = prm["h_step"]
@@ -364,7 +378,8 @@ def mc_probs(reads, hs, prm):
         h = max(hs[s], 0.0)
         sig = prm["sig24"] * (max(h, 0.5) / 24.0) ** prm["alpha"]
         hd = h / 24.0
-        mu = [base[q] + drift[q] * hd for q in range(n)]
+        hdp = hd ** prm["drift_pow"] if hd > 0 else 0.0
+        mu = [base[q] + drift[q] * hdp for q in range(n)]
         cnt = [[0] * n for _ in range(PLACES)]
         for _ in range(S):
             z = []
@@ -372,7 +387,7 @@ def mc_probs(reads, hs, prm):
                 e = rnd.gauss(0.0, 1.0)
                 if pj > 0 and rnd.random() < pj:
                     e *= tau
-                z.append((mu[q] + sig * e, q))
+                z.append((mu[q] + sig * sm[q] * e, q))
             z.sort(reverse=True)
             for k in range(PLACES):
                 cnt[k][z[k][1]] += 1
@@ -428,6 +443,9 @@ def build(reads, task, prm=None):
                 named = {u: v / tp * tot for u, v in powd.items()}
         m = len(named)
         named = {u: (1 - eps * m) * v + eps * target for u, v in named.items()}
+        drop = prm["drop_p"]
+        if drop > 0:
+            named = {u: v for u, v in named.items() if v >= drop}
         P[k] = named
         pnew_out.append(pn)
     return P, pnew_out
@@ -469,12 +487,30 @@ def to_doc(P, last_ids):
     return {"probabilities": rows, "top10": top[:PLACES]}
 
 
+def fallback(reads):
+    """Persistence spread over neighbouring places: used only if the model fails on its input."""
+    last = reads[-1]["ids"] if reads else []
+    P = {}
+    for k in range(PLACES):
+        named = {}
+        for r, u in enumerate(last[:30], 1):
+            named[u] = 0.8 * math.exp(-abs(math.log(r) - math.log(k + 1)) / 0.35)
+        tot = sum(named.values())
+        if tot > 0:
+            named = {u: v / tot * 0.8 for u, v in named.items()}
+        P[k] = named
+    return P
+
+
 def main():
     input_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
     output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
     reads, task = load(input_dir)
-    P, _ = build(reads, task)
-    doc = to_doc(P, reads[-1]["ids"])
+    try:
+        P, _ = build(reads, task)
+        doc = to_doc(P, reads[-1]["ids"])
+    except Exception:  # never leave the grader without a forecast
+        doc = to_doc(fallback(reads), reads[-1]["ids"] if reads else [])
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, task.get("output", "forecast.json")), "w", encoding="utf-8") as f:
         json.dump(doc, f, separators=(",", ":"))
