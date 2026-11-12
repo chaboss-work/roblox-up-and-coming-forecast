@@ -3,15 +3,24 @@
 Reads the chart history in $MAKEFUN_INPUT_DIR (default /input) and writes forecast.json to
 $MAKEFUN_OUTPUT_DIR (default /output). Standard library only, deterministic, no network.
 
-Method: a Monte Carlo of the chart's latent order. Each current game sits at -log(rank) plus a
-drift learned from the history (ridge regression of future log-rank change on the game's
-features times the horizon, recent reads weighted more) plus Gaussian noise growing with the
-horizon; every sample is sorted to count who lands at each place, at every hour of the window.
-The share of each place that games not yet on the chart have been taking at that horizon is
+Method (v3): a linear pool of three different forecasters, weighted to maximise the contest's
+log score on rolling backtests (Geweke and Amisano's optimal prediction pools):
+
+1. Monte Carlo of the chart's latent order with skewed (reflected Gumbel) noise: each current game
+   sits at -log(rank) plus a drift learned from the history (ridge regression of future log-rank
+   change on its features times the horizon, recent reads weighted more) plus noise growing with
+   the horizon; every sample is sorted to count who lands at each place, at every hour.
+2. The same simulation with heavy-tailed (Student t) noise.
+3. A conditional logit (discrete choice) model: each place of a later chart is a choice among the
+   games on the earlier chart, with a softmax over features of the game's distance to that place
+   and its momentum, fitted by maximum likelihood on every pair of history reads whose gap
+   matches the window, i.e. trained directly on the log score pooled over the window.
+
+The share of each place that games not yet on the chart have been taking at each horizon is
 measured on the history and left unnamed, so the scorer spreads it over the games that join
-later. Hourly stretches of the history are density-weighted so they count about as much per
-day as the sparse archive. One forecast is scored on all 72 charts, so each place's
-probabilities are the average over the hours.
+later. Hourly stretches of the history are density-weighted so they count about as much per day
+as the sparse archive. If a forecaster fails, the pool renormalises over the others; if all fail,
+a persistence forecast is written.
 """
 import json
 import math
@@ -77,7 +86,15 @@ DEFAULTS = {
     "f_prank": True,    # rank by players vs chart rank feature
     "drift_half": 3.0,  # half-life (days) of the recency weight in the drift fit
     "pn_dens": True,    # density-weight the new-game rate like the drift fit
-    "sig_low": 0.0,     # extra noise below place 10 (off)
+    "sig_low": 0.0,
+    "f_nonlin": False,  # extra nonlinear features
+    "f_life": False,    # age-on-chart bins (life-cycle curve)
+    "noise": "gauss",   # gauss | gumbel | ngumbel | logistic | resid | student
+    "resid_scale": 1.0,
+    "t_df": 4.0,
+    "reloc": 0.0,       # per-day chance a game is displaced to a uniform random rank
+    "vol_beta": 0.0,    # sigma *= (recent churn / overall churn) ** vol_beta
+    "vol_hours": 48.0,
 }
 
 
@@ -214,6 +231,13 @@ def features(reads, i, first, use_g72=True, prm=None):
         out[u] = [tr, g, order[u] / n, math.log(r), age, newin, g3, top]
         if fpr:
             out[u].append(math.log(prk[u] / r))
+        if prm and prm.get("f_nonlin"):
+            lr = math.log(r)
+            out[u] += [tr * tr, g * g, tr * lr, age * lr]
+        if prm and prm.get("f_life"):
+            ah = (hours(reads[f]["t"], ti) if f > 0 else 999.0)
+            out[u] += [1.0 if ah < 12 else 0.0, 1.0 if 12 <= ah < 36 else 0.0, 1.0 if 36 <= ah < 72 else 0.0,
+                       1.0 if 72 <= ah < 144 else 0.0]
     return out
 
 
@@ -254,7 +278,7 @@ def density(reads, width):
 
 def fit_drift(reads, first, prm):
     """Least squares of future log-rank change on features times horizon (per day), from the history."""
-    nf = 9 if prm.get("f_prank") else 8
+    nf = 8 + (1 if prm.get("f_prank") else 0) + (4 if prm.get("f_nonlin") else 0) + (4 if prm.get("f_life") else 0)
     m = nf + 1
     tend = reads[-1]["t"]
     dh = prm.get("drift_half", 0.0) * 24.0
@@ -301,6 +325,75 @@ def fit_drift(reads, first, prm):
         A[a][a] += lam
     beta = solve(A, B)
     return beta[1:]
+
+
+def resid_pool(reads, first, beta, prm, cap=6000):
+    """Standardised residuals of the drift fit, -(y - x.beta) / (h/24)^alpha, for bootstrap noise."""
+    t0 = reads[0]["t"]
+    out = []
+    al = prm["alpha"]
+    kap = prm["kappa"]
+    for i in range(len(reads)):
+        if hours(t0, reads[i]["t"]) < 30:
+            continue
+        F = None
+        for j in range(i + 1, len(reads)):
+            h = hours(reads[i]["t"], reads[j]["t"])
+            if h > 72:
+                break
+            if h < 6:
+                continue
+            if F is None:
+                F = features(reads, i, first, prm["use_g72"], prm)
+            pos = {u: q for q, u in enumerate(reads[j]["ids"], 1)}
+            hd = h / 24.0
+            for r, u in enumerate(reads[i]["ids"], 1):
+                if r > 60:
+                    break
+                y = math.log(pos.get(u, 130) / r)
+                pred = kap * hd * sum(b * v for b, v in zip(beta, F[u]))
+                out.append(-(y - pred) / (hd ** al))
+    if not out:
+        return [0.0]
+    m = sum(out) / len(out)
+    out = [v - m for v in out]
+    if len(out) > cap:
+        step = len(out) / cap
+        out = [out[int(k * step)] for k in range(cap)]
+    return out
+
+
+def vol_ratio(reads, prm):
+    """Recent churn of the chart vs its whole-history churn (mean |log rank change| per day^alpha)."""
+    al = prm["alpha"]
+    tend = reads[-1]["t"]
+    rec, allv = [0.0, 0], [0.0, 0]
+    for i in range(len(reads)):
+        pos_i = None
+        for j in range(i + 1, len(reads)):
+            h = hours(reads[i]["t"], reads[j]["t"])
+            if h > 30:
+                break
+            if h < 6:
+                continue
+            if pos_i is None:
+                pos_i = {u: q for q, u in enumerate(reads[i]["ids"], 1)}
+            s, n = 0.0, 0
+            for q, u in enumerate(reads[j]["ids"][:40], 1):
+                r = pos_i.get(u)
+                if r is not None:
+                    s += abs(math.log(q / r))
+                    n += 1
+            if n:
+                v = s / n / (h / 24.0) ** al
+                allv[0] += v
+                allv[1] += 1
+                if hours(reads[j]["t"], tend) <= prm["vol_hours"]:
+                    rec[0] += v
+                    rec[1] += 1
+    if rec[1] < 3 or allv[1] < 3:
+        return 1.0
+    return (rec[0] / rec[1]) / (allv[0] / allv[1])
 
 
 def pnew_by_h(reads, hs, prm):
@@ -386,6 +479,32 @@ def mc_probs(reads, hs, prm):
     if sl:
         sm = [v * max(0.2, 1.0 + sl * max(0.0, math.log(r) - math.log(10.0))) for r, v in zip(range(1, len(ids) + 1), sm)]
     rnd = __import__("random").Random(prm["seed"])
+    noise = prm.get("noise", "gauss")
+    pool = resid_pool(reads, first, beta, prm) if noise == "resid" else None
+    rs = prm.get("resid_scale", 1.0)
+    vmult = vol_ratio(reads, prm) ** prm["vol_beta"] if prm.get("vol_beta") else 1.0
+    reloc = prm.get("reloc", 0.0)
+    tdf = prm.get("t_df", 4.0)
+    tsc = math.sqrt((tdf - 2.0) / tdf) if tdf > 2 else 1.0
+    G = 0.5772156649
+    GS = math.pi / math.sqrt(6.0)
+    LS = math.pi / math.sqrt(3.0)
+
+    def draw():
+        if noise == "gauss":
+            return rnd.gauss(0.0, 1.0)
+        if noise == "gumbel":
+            return (-math.log(-math.log(rnd.random() or 1e-12)) - G) / GS
+        if noise == "ngumbel":
+            return -(-math.log(-math.log(rnd.random() or 1e-12)) - G) / GS
+        if noise == "logistic":
+            p = min(max(rnd.random(), 1e-12), 1 - 1e-12)
+            return math.log(p / (1 - p)) / LS
+        if noise == "student":
+            z = rnd.gauss(0.0, 1.0)
+            c = rnd.gammavariate(tdf / 2.0, 2.0)
+            return z / math.sqrt(c / tdf) * tsc
+        return pool[rnd.randrange(len(pool))]
     S = prm["samples"]
     step = prm["h_step"]
     counts = [dict() for _ in range(PLACES)]
@@ -396,7 +515,11 @@ def mc_probs(reads, hs, prm):
     pj, tau = prm["jump_p"], prm["jump_sd"]
     for s in hsel:
         h = max(hs[s], 0.0)
-        sig = prm["sig24"] * (max(h, 0.5) / 24.0) ** prm["alpha"]
+        sig = prm["sig24"] * (max(h, 0.5) / 24.0) ** prm["alpha"] * vmult
+        if noise == "resid":
+            sig = rs * (max(h, 0.5) / 24.0) ** prm["alpha"] * vmult
+        prl = 1.0 - math.exp(-reloc * max(h, 0.0) / 24.0) if reloc > 0 else 0.0
+        lowz = -math.log(n + 1.0)
         hd = h / 24.0
         hdp = hd ** prm["drift_pow"] if hd > 0 else 0.0
         mu = [base[q] + drift[q] * hdp for q in range(n)]
@@ -404,7 +527,10 @@ def mc_probs(reads, hs, prm):
         for _ in range(S):
             z = []
             for q in range(n):
-                e = rnd.gauss(0.0, 1.0)
+                if prl > 0 and rnd.random() < prl:
+                    z.append((-math.log(1.0 + rnd.random() * n), q))
+                    continue
+                e = draw()
                 if pj > 0 and rnd.random() < pj:
                     e *= tau
                 z.append((mu[q] + sig * sm[q] * e, q))
@@ -436,8 +562,12 @@ def build(reads, task, prm=None):
     last = reads[-1]["ids"][:prm["max_rank"]]
     eps = prm["eps"]
     lam = prm["mix_kernel"]
-    C, N, pnew_k = kernel(reads, hs, prm)
-    M = smooth(C, N, prm)
+    if lam > 0:
+        C, N, pnew_k = kernel(reads, hs, prm)
+        M = smooth(C, N, prm)
+    else:  # the empirical kernel is off: skip it
+        M = [[0.0] * (PLACES + 1) for _ in range(len(last) + 2)]
+        pnew_k = [0.0] * PLACES
     if lam < 1.0:
         mc, pnew_m, _ = mc_probs(reads, hs, prm)
     P = {}
@@ -522,13 +652,236 @@ def fallback(reads):
     return P
 
 
+CL_DEFAULTS = dict(DEFAULTS, cl_maxr=80, cl_l2=2.0, cl_iters=12, cl_bw=4.0, cl_rich=True, cl_hbal=False)
+NF = 15
+RICH = False
+
+
+def phi(Fu, r, k):
+    tr, g, _uid, lr, age, newin, g3, _top, prank = Fu[:9]
+    d = math.log(r) - math.log(k)
+    out = [d * d, abs(d), d, 1.0 if r == k else 0.0, d * tr, d * g, d * g3, d * prank,
+           tr, g, g3, prank, newin, age, d * age]
+    if RICH:
+        tk = 1.0 if k <= 3 else 0.0
+        out += [d * newin, d * d * tr, (1.0 if r == k else 0.0) * tk, lr, d * tk, lr * tr,
+                1.0 if abs(r - k) == 1 else 0.0]
+    return out
+
+
+def objective(groups, theta, lam):
+    L = 0.0
+    for Phi, ys in groups:
+        s = [sum(a * b for a, b in zip(theta, f)) for f in Phi]
+        mx = max(s)
+        lz = mx + math.log(sum(math.exp(v - mx) for v in s))
+        for y, wy in ys.items():
+            L += wy * (s[y - 1] - lz)
+    return L - 0.5 * lam * sum(v * v for v in theta)
+
+
+def build_clogit(reads, task, prm=None):
+    global NF, RICH
+    prm = dict(CL_DEFAULTS, **(prm or {}))
+    prm["f_prank"] = True
+    RICH = bool(prm["cl_rich"])
+    NF = 22 if RICH else 15
+    hs = horizons(reads, task)
+    first = {}
+    for i, r in enumerate(reads):
+        for u in r["ids"]:
+            first.setdefault(u, i)
+    n = len(reads)
+    t = [r["t"] for r in reads]
+    dens = density(reads, prm["dens_h"])
+    bw = prm["cl_bw"]
+    maxr = prm["cl_maxr"]
+    tend = t[-1]
+    dh = prm.get("drift_half", 0.0) * 24.0
+    # horizon balance: every gap bin gets the weight the window gives it, however many read pairs
+    # the history happens to have at that gap (an hourly tail would otherwise flood the short gaps)
+    fbin = None
+    if prm.get("cl_hbal"):
+        T = {}
+        Mw = {}
+        for i in range(n):
+            if hours(t[0], t[i]) < 30:
+                continue
+            for j in range(i + 1, n):
+                h = hours(t[i], t[j])
+                if h > hs[-1] + bw:
+                    break
+                b = int(h)
+                w = 1.0 / (dens[i] * dens[j])
+                if dh > 0:
+                    w *= 0.5 ** (hours(t[i], tend) / dh)
+                T[b] = T.get(b, 0.0) + w
+        for b in T:
+            m_ = 0.0
+            for hh in hs:
+                dd = abs(b + 0.5 - hh)
+                if dd < bw:
+                    m_ += 1.0 - dd / bw
+            Mw[b] = m_
+        st, sm = sum(T.values()), sum(Mw.values())
+        fbin = {b: (Mw[b] / T[b]) * (st / sm) if T[b] > 0 and sm > 0 else 0.0 for b in T}
+    groups = []  # (Phi[a] list, {y_rank: weight})
+    for i in range(n):
+        if hours(t[0], t[i]) < 30:
+            continue
+        ys = [dict() for _ in range(10)]
+        any_ev = False
+        rank_i = {u: q for q, u in enumerate(reads[i]["ids"][:maxr], 1)}
+        for j in range(i + 1, n):
+            h = hours(t[i], t[j])
+            if h > hs[-1] + bw:
+                break
+            ws = 0.0
+            for hh in hs:
+                dd = abs(h - hh)
+                if dd < bw:
+                    ws += 1.0 - dd / bw
+            if ws <= 0:
+                continue
+            w = ws / (dens[i] * dens[j])
+            if dh > 0:
+                w *= 0.5 ** (hours(t[i], tend) / dh)
+            if fbin is not None:
+                w = fbin.get(int(h), 0.0) / (dens[i] * dens[j]) * (0.5 ** (hours(t[i], tend) / dh) if dh > 0 else 1.0)
+                if w <= 0:
+                    continue
+            for k in range(10):
+                if k >= len(reads[j]["ids"]):
+                    break
+                y = rank_i.get(reads[j]["ids"][k])
+                if y is None:
+                    continue
+                ys[k][y] = ys[k].get(y, 0.0) + w
+                any_ev = True
+        if not any_ev:
+            continue
+        F = features(reads, i, first, True, prm)
+        ids = reads[i]["ids"][:maxr]
+        for k in range(10):
+            if ys[k]:
+                Phi = [phi(F[u], r, k + 1) for r, u in enumerate(ids, 1)]
+                groups.append((Phi, ys[k]))
+    theta = [0.0] * NF
+    theta[0] = -1.0
+    lam = prm["cl_l2"]
+    for _ in range(prm["cl_iters"]):
+        g = [0.0] * NF
+        H = [[0.0] * NF for _ in range(NF)]
+        for Phi, ys in groups:
+            s = [sum(a * b for a, b in zip(theta, f)) for f in Phi]
+            mx = max(s)
+            e = [math.exp(v - mx) for v in s]
+            z = sum(e)
+            p = [v / z for v in e]
+            W = sum(ys.values())
+            mu = [0.0] * NF
+            for pa, f in zip(p, Phi):
+                if pa < 1e-12:
+                    continue
+                for c in range(NF):
+                    mu[c] += pa * f[c]
+            for y, wy in ys.items():
+                fy = Phi[y - 1]
+                for c in range(NF):
+                    g[c] += wy * (fy[c] - mu[c])
+            for pa, f in zip(p, Phi):
+                if pa < 1e-9:
+                    continue
+                wp = W * pa
+                for c in range(NF):
+                    dc = f[c] - mu[c]
+                    if dc == 0.0:
+                        continue
+                    row = H[c]
+                    v = wp * dc
+                    for c2 in range(c, NF):
+                        row[c2] += v * (f[c2] - mu[c2])
+        for c in range(NF):
+            for c2 in range(c):
+                H[c][c2] = H[c2][c]
+            g[c] -= lam * theta[c]
+            H[c][c] += lam
+        step = solve(H, g)
+        base = objective(groups, theta, lam)
+        a = 1.0
+        for _ in range(12):
+            cand = [x + a * y for x, y in zip(theta, step)]
+            if objective(groups, cand, lam) > base:
+                break
+            a *= 0.5
+        else:
+            break
+        theta = cand
+        if max(abs(v) for v in step) * a < 1e-4:
+            break
+    pn = pnew_by_h(reads, hs, prm)
+    pnew = [sum(pn[s][k] for s in range(len(hs))) / len(hs) for k in range(10)]
+    F = features(reads, n - 1, first, True, prm)
+    last = reads[-1]["ids"]
+    P = {}
+    eps = prm["eps"]
+    for k in range(10):
+        s = [sum(a * b for a, b in zip(theta, phi(F[u], r, k + 1))) for r, u in enumerate(last, 1)]
+        mx = max(s)
+        e = [math.exp(v - mx) for v in s]
+        z = sum(e)
+        tgt = 1.0 - pnew[k]
+        m = len(last)
+        P[k] = {u: (1 - eps * m) * tgt * v / z + eps * tgt for u, v in zip(last, e)}
+    build_clogit.theta = theta
+    return P, pnew
+
+
+# pool weights fitted by EM on the backtest cuts (leave-one-cut-out -35.41 vs -35.68 for the
+# single Gaussian simulation)
+POOL = [
+    ("mc_reflected_gumbel", 0.510, {"noise": "ngumbel"}),
+    ("mc_student_t", 0.149, {"noise": "student"}),
+    ("conditional_logit", 0.341, None),
+]
+
+
+# a deterministic guard on the input size (not on wall time, which would break the
+# byte-for-byte rerun): a very long history runs only the pool's main forecaster
+MAX_READS_FULL_POOL = 260
+
+
+def build_pool(reads, task):
+    parts = []
+    pool = POOL if len(reads) <= MAX_READS_FULL_POOL else POOL[:1]
+    for _name, w, prm in pool:
+        try:
+            if prm is None:
+                P, _ = build_clogit(reads, task)
+            else:
+                P, _ = build(reads, task, prm)
+            parts.append((w, P))
+        except Exception:  # a failing forecaster drops out; the others are renormalised
+            continue
+    if not parts:
+        raise RuntimeError("no forecaster ran")
+    tw = sum(w for w, _ in parts)
+    out = {}
+    for k in range(PLACES):
+        d = {}
+        for w, P in parts:
+            for u, p in P[k].items():
+                d[u] = d.get(u, 0.0) + w / tw * p
+        out[k] = d
+    return out
+
+
 def main():
     input_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
     output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
     reads, task = load(input_dir)
     try:
-        P, _ = build(reads, task)
-        doc = to_doc(P, reads[-1]["ids"])
+        doc = to_doc(build_pool(reads, task), reads[-1]["ids"])
     except Exception:  # never leave the grader without a forecast
         doc = to_doc(fallback(reads), reads[-1]["ids"] if reads else [])
     os.makedirs(output_dir, exist_ok=True)
