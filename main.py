@@ -3,12 +3,15 @@
 Reads the chart history in $MAKEFUN_INPUT_DIR (default /input) and writes forecast.json to
 $MAKEFUN_OUTPUT_DIR (default /output). Standard library only, deterministic, no network.
 
-Method (v1): an empirical rank-transition kernel learned from the history itself. For every pair
-of reads whose time gap matches one of the window's horizons, count where each game at rank r
-ended up; pool those counts over the 72 horizons (each horizon weighted equally), smooth them over
-neighbouring ranks in log-rank space, and read each current game's place probabilities off the
-row of its current rank. The share of top-10 places taken by games not on the earlier chart is
-left unnamed, which the scorer spreads over games that join the chart later.
+Method: a Monte Carlo of the chart's latent order. Each current game sits at -log(rank) plus a
+drift learned from the history (ridge regression of future log-rank change on the game's
+features times the horizon, recent reads weighted more) plus Gaussian noise growing with the
+horizon; every sample is sorted to count who lands at each place, at every hour of the window.
+The share of each place that games not yet on the chart have been taking at that horizon is
+measured on the history and left unnamed, so the scorer spreads it over the games that join
+later. Hourly stretches of the history are density-weighted so they count about as much per
+day as the sparse archive. One forecast is scored on all 72 charts, so each place's
+probabilities are the average over the hours.
 """
 import json
 import math
@@ -71,6 +74,10 @@ DEFAULTS = {
     "samples": 1000,    # Monte Carlo samples per sampled horizon
     "h_step": 1,        # sample every h_step-th slot
     "seed": 20261113,
+    "f_prank": True,    # rank by players vs chart rank feature
+    "drift_half": 3.0,  # half-life (days) of the recency weight in the drift fit
+    "pn_dens": True,    # density-weight the new-game rate like the drift fit
+    "sig_low": 0.0,     # extra noise below place 10 (off)
 }
 
 
@@ -177,7 +184,7 @@ def back_read(reads, i, target, lo, hi):
     return p
 
 
-def features(reads, i, first, use_g72=True):
+def features(reads, i, first, use_g72=True, prm=None):
     """Per-game features at read i: [trend, growth, uid recency, log rank, age, new-in-24h, growth72, top]."""
     ti = reads[i]["t"]
     p = back_read(reads, i, 24.0, 12.0, 36.0)
@@ -190,6 +197,9 @@ def features(reads, i, first, use_g72=True):
     pl_p = reads[p]["playing"] if p is not None else {}
     pl_i = reads[i]["playing"]
     out = {}
+    fpr = bool(prm and prm.get("f_prank"))
+    if fpr:
+        prk = {u: q for q, u in enumerate(sorted(ids, key=lambda u: (-(pl_i.get(u) or 0), u)), 1)}
     for r, u in enumerate(ids, 1):
         if p is not None:
             tr = math.log(pp.get(u, 110) / r)
@@ -202,6 +212,8 @@ def features(reads, i, first, use_g72=True):
         g3 = math.log((pl_i.get(u, 0) + 20) / (pl3[u] + 20)) if u in pl3 else 0.0
         top = max(0.0, 1.0 - math.log(r) / math.log(4.0))
         out[u] = [tr, g, order[u] / n, math.log(r), age, newin, g3, top]
+        if fpr:
+            out[u].append(math.log(prk[u] / r))
     return out
 
 
@@ -242,8 +254,10 @@ def density(reads, width):
 
 def fit_drift(reads, first, prm):
     """Least squares of future log-rank change on features times horizon (per day), from the history."""
-    nf = 8
+    nf = 9 if prm.get("f_prank") else 8
     m = nf + 1
+    tend = reads[-1]["t"]
+    dh = prm.get("drift_half", 0.0) * 24.0
     A = [[0.0] * m for _ in range(m)]
     B = [0.0] * m
     cnt = 0
@@ -261,8 +275,10 @@ def fit_drift(reads, first, prm):
             if h < 6:
                 continue
             if F is None:
-                F = features(reads, i, first, prm["use_g72"])
+                F = features(reads, i, first, prm["use_g72"], prm)
             w = 1.0 / (dens[i] * dens[j])
+            if dh > 0:
+                w *= 0.5 ** (hours(reads[i]["t"], tend) / dh)
             pos = {u: q for q, u in enumerate(reads[j]["ids"], 1)}
             hd = h / 24.0
             for r, u in enumerate(reads[i]["ids"], 1):
@@ -299,6 +315,7 @@ def pnew_by_h(reads, hs, prm):
     times = [r["t"] for r in reads]
     tend = times[-1]
     half = prm["pn_half"] * 24.0
+    dens = density(reads, prm["dens_h"]) if prm.get("pn_dens") else [1.0] * len(reads)
     for i in range(len(reads)):
         set_a = None
         rec = 0.5 ** (hours(times[i], tend) / half) if half > 0 else 1.0
@@ -314,7 +331,7 @@ def pnew_by_h(reads, hs, prm):
             for s, hh in enumerate(hs):
                 d = abs(h - hh)
                 if d < bw:
-                    k = (1.0 - d / bw) * rec
+                    k = (1.0 - d / bw) * rec / (dens[i] * dens[j])
                     den[s] += k
                     num[s] += k * fl
     g = prm["pn_slope"]
@@ -350,7 +367,7 @@ def mc_probs(reads, hs, prm):
         for u in r["ids"]:
             first.setdefault(u, i)
     beta = fit_drift(reads, first, prm)
-    F = features(reads, len(reads) - 1, first, prm["use_g72"])
+    F = features(reads, len(reads) - 1, first, prm["use_g72"], prm)
     ids = reads[-1]["ids"][:prm["max_rank"]]
     kappa = prm["kappa"]
     gam = prm["gamma"]
@@ -365,6 +382,9 @@ def mc_probs(reads, hs, prm):
     drift = [-kappa * jac[q] * sum(b * v for b, v in zip(beta, F[u])) for q, u in enumerate(ids)]  # per day, latent up = better
     tt = prm["top_sig"]
     sm = [1.0 + tt * max(0.0, 1.0 - math.log(r) / math.log(4.0)) for r in range(1, len(ids) + 1)]
+    sl = prm.get("sig_low", 0.0)
+    if sl:
+        sm = [v * max(0.2, 1.0 + sl * max(0.0, math.log(r) - math.log(10.0))) for r, v in zip(range(1, len(ids) + 1), sm)]
     rnd = __import__("random").Random(prm["seed"])
     S = prm["samples"]
     step = prm["h_step"]
